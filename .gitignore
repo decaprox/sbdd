@@ -1,1 +1,9 @@
 .wip/
+.vagrant/
+*.cmd
+*.o
+*.ko
+*.mod
+*.mod.*
+*.symvers
+*.order

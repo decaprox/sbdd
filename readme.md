@@ -10,6 +10,9 @@ uncomment `CFLAGS_sbdd.o := -DDEBUG` in `Kbuild`
 ## Clean
 `$ make clean`
 
+## Tests
+`$ make tests`
+
 ## References
 - [Linux Device Drivers](https://lwn.net/Kernel/LDD3/)
 - [Linux Kernel Development](https://rlove.org)
