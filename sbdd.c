@@ -79,7 +79,7 @@ static void sbdd_xfer_bio(struct bio *bio)
 		pos += sbdd_xfer(&bvec, pos, dir);
 }
 
-static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
+static blk_qc_t sbdd_submit_bio(struct bio *bio)
 {
 	if (atomic_read(&__sbdd.deleting)) {
 		bio_io_error(bio);
@@ -105,7 +105,8 @@ There are no read or write operations. These operations are performed by
 the request() function associated with the request queue of the disk.
 */
 static struct block_device_operations const __sbdd_bdev_ops = {
-	.owner = THIS_MODULE,
+	.owner          = THIS_MODULE,
+	.submit_bio     = sbdd_submit_bio,
 };
 
 static int sbdd_create(void)
@@ -136,29 +137,21 @@ static int sbdd_create(void)
 	spin_lock_init(&__sbdd.datalock);
 	init_waitqueue_head(&__sbdd.exitwait);
 
-	pr_info("allocating queue\n");
-	__sbdd.q = blk_alloc_queue(GFP_KERNEL);
-	if (!__sbdd.q) {
-		pr_err("call blk_alloc_queue() failed\n");
-		return -EINVAL;
-	}
-	blk_queue_make_request(__sbdd.q, sbdd_make_request);
-
 	/* Configure queue */
-	blk_queue_logical_block_size(__sbdd.q, SBDD_SECTOR_SIZE);
 
 	/* A disk must have at least one minor */
 	pr_info("allocating disk\n");
-	__sbdd.gd = alloc_disk(1);
+	__sbdd.gd = blk_alloc_disk(NUMA_NO_NODE);
 
 	/* Configure gendisk */
-	__sbdd.gd->queue = __sbdd.q;
 	__sbdd.gd->major = __sbdd_major;
 	__sbdd.gd->first_minor = 0;
+	__sbdd.gd->minors = 1;
 	__sbdd.gd->fops = &__sbdd_bdev_ops;
 	/* Represents name in /proc/partitions and /sys/block */
 	scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
 	set_capacity(__sbdd.gd, __sbdd.capacity);
+	blk_queue_logical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
 	atomic_set(&__sbdd.refs_cnt, 1);
 
 	/*
@@ -167,7 +160,9 @@ static int sbdd_create(void)
 	called before the driver is fully initialized and ready to process reqs.
 	*/
 	pr_info("adding disk\n");
-	add_disk(__sbdd.gd);
+	ret = add_disk(__sbdd.gd);
+	if (ret)
+		pr_err("call add_disk() failed!");
 
 	return ret;
 }

@@ -1,5 +1,5 @@
 # Simple Block Device Driver
-Implementation of Linux Kernel 5.4.X simple block device.
+Implementation of Linux Kernel 5.15.X simple block device.
 
 ## Build
 - regular:
