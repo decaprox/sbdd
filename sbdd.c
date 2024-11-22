@@ -34,6 +34,7 @@ struct sbdd {
 	struct gendisk          *gd;
 	struct bio_set          bio_set;
 	struct block_device     *target;
+	char                    *target_path;
 };
 
 static struct sbdd      __sbdd;
@@ -122,8 +123,14 @@ static int sbdd_get_target(const char *path)
 	int ret = 0;
 	struct block_device *bdev = NULL;
 	sector_t capacity = 0;
+	char *new_path;
 
-	bdev = blkdev_get_by_path(path, SBDD_TARGET_FLAGS, &__sbdd);
+	new_path = kstrdup(path, GFP_KERNEL);
+	if (!new_path)
+		return -ENOMEM;
+	strim(new_path);
+
+	bdev = blkdev_get_by_path(new_path, SBDD_TARGET_FLAGS, &__sbdd);
 	if (IS_ERR(bdev)) {
 		ret = PTR_ERR(bdev);
 		pr_err("call blkdev_get_by_path() failed with %d\n", ret);
@@ -144,6 +151,7 @@ static int sbdd_get_target(const char *path)
 	}
 
 	__sbdd.target = bdev;
+	__sbdd.target_path = new_path;
 	__sbdd.capacity = capacity;
 	set_capacity(__sbdd.gd, __sbdd.capacity);
 
@@ -160,10 +168,40 @@ static void sbdd_put_target(void)
 	if (__sbdd.target) {
 		bd_unlink_disk_holder(__sbdd.target, __sbdd.gd);
 		blkdev_put(__sbdd.target, SBDD_TARGET_FLAGS);
+		kfree(__sbdd.target_path);
+		__sbdd.target_path = NULL;
 		__sbdd.target = NULL;
 		__sbdd.capacity = 0;
 	}
 }
+
+static ssize_t sbdd_sysfs_target_show(struct device *dev,
+				      struct device_attribute *attr,
+				      char *buf)
+{
+	if (!__sbdd.target_path)
+		return sprintf(buf, "None\n");
+	return sprintf(buf, "%s\n", __sbdd.target_path);
+}
+
+static ssize_t sbdd_sysfs_target_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	int ret;
+
+	sbdd_put_target();
+
+	ret = sbdd_get_target(buf);
+	if (ret) {
+		pr_err("failed to set target\n");
+		return ret;
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR(target, 0644, sbdd_sysfs_target_show, sbdd_sysfs_target_store);
 
 static int sbdd_create(void)
 {
@@ -231,6 +269,14 @@ static int sbdd_create(void)
 	if (ret)
 		pr_err("call add_disk() failed!");
 
+	/* Add the `target` parameter to /sys/block/sbdd */
+	pr_info("creating /sys/block/sbdd/target\n");
+	ret = device_create_file(disk_to_dev(__sbdd.gd), &dev_attr_target);
+	if (ret) {
+		pr_err("call device_create_file() failed with %d\n", ret);
+		return ret;
+	}
+
 	return ret;
 }
 
@@ -249,6 +295,9 @@ static void sbdd_delete(void)
 		del_gendisk(__sbdd.gd);
 		put_disk(__sbdd.gd);
 	}
+
+	if (__sbdd.target_path)
+		kfree(__sbdd.target_path);
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
 
