@@ -22,8 +22,8 @@
 
 #define SBDD_SECTOR_SHIFT      9
 #define SBDD_SECTOR_SIZE       (1 << SBDD_SECTOR_SHIFT)
-#define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME              "sbdd"
+#define SBDD_TARGET_FLAGS      (FMODE_READ | FMODE_WRITE | FMODE_EXCL)
 
 struct sbdd {
 	wait_queue_head_t       exitwait;
@@ -31,73 +31,81 @@ struct sbdd {
 	atomic_t                deleting;
 	atomic_t                refs_cnt;
 	sector_t                capacity;
-	u8                      *data;
 	struct gendisk          *gd;
-	struct request_queue    *q;
+	struct bio_set          bio_set;
+	struct block_device     *target;
 };
 
 static struct sbdd      __sbdd;
 static int              __sbdd_major = 0;
-static unsigned long    __sbdd_capacity_mib = 100;
+static char             *__sbdd_param_target_path = NULL;
 
-static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
+static void sbdd_bio_end_io(struct bio *bio)
 {
-	void *buff = kmap_atomic(bvec->bv_page) + bvec->bv_offset;
-	sector_t len = bvec->bv_len >> SBDD_SECTOR_SHIFT;
-	size_t offset;
-	size_t nbytes;
+	struct bio *orig_bio = bio->bi_private;
 
-	if (pos + len > __sbdd.capacity)
-		len = __sbdd.capacity - pos;
-
-	offset = pos << SBDD_SECTOR_SHIFT;
-	nbytes = len << SBDD_SECTOR_SHIFT;
-
-	spin_lock(&__sbdd.datalock);
-
-	if (dir)
-		memcpy(__sbdd.data + offset, buff, nbytes);
+	if (bio->bi_status)
+		bio_io_error(orig_bio);
 	else
-		memcpy(buff, __sbdd.data + offset, nbytes);
+		bio_endio(orig_bio);
 
-	spin_unlock(&__sbdd.datalock);
-
-	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
-
-	kunmap_atomic(buff);
-	return len;
-}
-
-static void sbdd_xfer_bio(struct bio *bio)
-{
-	struct bvec_iter iter;
-	struct bio_vec bvec;
-	int dir = bio_data_dir(bio);
-	sector_t pos = bio->bi_iter.bi_sector;
-
-	bio_for_each_segment(bvec, bio, iter)
-		pos += sbdd_xfer(&bvec, pos, dir);
+	bio_put(bio);
 }
 
 static blk_qc_t sbdd_submit_bio(struct bio *bio)
 {
+	struct bio *clone = NULL;
+	int ret = BLK_STS_OK;
+
 	if (atomic_read(&__sbdd.deleting)) {
-		bio_io_error(bio);
-		return BLK_STS_IOERR;
+		pr_err("submit_bio error: device is deleting now\n");
+		ret = BLK_STS_IOERR;
+		goto out;
 	}
 
 	if (!atomic_inc_not_zero(&__sbdd.refs_cnt)) {
-		bio_io_error(bio);
-		return BLK_STS_IOERR;
+		pr_err("submit_bio error: device is busy\n");
+		ret = BLK_STS_IOERR;
+		goto out;
 	}
 
-	sbdd_xfer_bio(bio);
-	bio_endio(bio);
+	/*
+	 * In reality target is not specified capacity will be 0.
+	 * And when you try to write it will get -ENOSPC error
+	 * and this function will not be called. But I will leave
+	 * this check just in case.
+	 */
+	if (!__sbdd.target) {
+		pr_warn("there are no associated target devices\n");
 
+		/*
+		 * It would be better to use BLK_STS_OFFLINE here, but this
+		 * status was introduced in kernel 5.18.
+		 */
+		bio->bi_status = BLK_STS_TARGET;
+		bio_endio(bio);
+		ret = BLK_STS_TARGET;
+		goto out;
+	}
+
+	clone = bio_clone_fast(bio, GFP_KERNEL, &__sbdd.bio_set);
+	if (!clone) {
+		pr_err("call bio_clone_fast() failed");
+		bio_io_error(bio);
+		ret = BLK_STS_IOERR;
+		goto out;
+	}
+
+	clone->bi_private = bio;
+	clone->bi_end_io = sbdd_bio_end_io;
+	bio_set_dev(clone, __sbdd.target);
+	submit_bio(clone);
+
+out:
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
 		wake_up(&__sbdd.exitwait);
 
-	return BLK_STS_OK;
+	return ret;
 }
 
 /*
@@ -108,6 +116,54 @@ static struct block_device_operations const __sbdd_bdev_ops = {
 	.owner          = THIS_MODULE,
 	.submit_bio     = sbdd_submit_bio,
 };
+
+static int sbdd_get_target(const char *path)
+{
+	int ret = 0;
+	struct block_device *bdev = NULL;
+	sector_t capacity = 0;
+
+	bdev = blkdev_get_by_path(path, SBDD_TARGET_FLAGS, &__sbdd);
+	if (IS_ERR(bdev)) {
+		ret = PTR_ERR(bdev);
+		pr_err("call blkdev_get_by_path() failed with %d\n", ret);
+		goto out;
+	}
+
+	ret = bd_link_disk_holder(bdev, __sbdd.gd);
+	if (ret) {
+		pr_err("call bd_link_disk_holder() failed with %d\n", ret);
+		goto out;
+	}
+
+	capacity = get_capacity(bdev->bd_disk);
+	if (!capacity) {
+		pr_err("wrong capacity\n");
+		ret = -ENODEV;
+		goto out_putbdev;
+	}
+
+	__sbdd.target = bdev;
+	__sbdd.capacity = capacity;
+	set_capacity(__sbdd.gd, __sbdd.capacity);
+
+	return 0;
+
+out_putbdev:
+	blkdev_put(bdev, SBDD_TARGET_FLAGS);
+out:
+	return ret;
+}
+
+static void sbdd_put_target(void)
+{
+	if (__sbdd.target) {
+		bd_unlink_disk_holder(__sbdd.target, __sbdd.gd);
+		blkdev_put(__sbdd.target, SBDD_TARGET_FLAGS);
+		__sbdd.target = NULL;
+		__sbdd.capacity = 0;
+	}
+}
 
 static int sbdd_create(void)
 {
@@ -125,19 +181,9 @@ static int sbdd_create(void)
 	}
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
-	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
-
-	pr_info("allocating data\n");
-	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
-	if (!__sbdd.data) {
-		pr_err("unable to alloc data\n");
-		return -ENOMEM;
-	}
-
 	spin_lock_init(&__sbdd.datalock);
 	init_waitqueue_head(&__sbdd.exitwait);
 
-	/* Configure queue */
 
 	/* A disk must have at least one minor */
 	pr_info("allocating disk\n");
@@ -148,10 +194,31 @@ static int sbdd_create(void)
 	__sbdd.gd->first_minor = 0;
 	__sbdd.gd->minors = 1;
 	__sbdd.gd->fops = &__sbdd_bdev_ops;
+
+	/* Initialize bio_set */
+	pr_info("initializing bio_set\n");
+	ret = bioset_init(&__sbdd.bio_set, BIO_POOL_SIZE, 0, 0);
+	if (ret) {
+		pr_err("call bioset_init() failed\n");
+		return ret;
+	}
+
 	/* Represents name in /proc/partitions and /sys/block */
 	scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
-	set_capacity(__sbdd.gd, __sbdd.capacity);
+
+	/* Configure queue */
 	blk_queue_logical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
+
+	/* Open target device */
+	if (__sbdd_param_target_path) {
+		pr_info("getting target device");
+		ret = sbdd_get_target(__sbdd_param_target_path);
+		if (ret) {
+			pr_err("target openning failed\n");
+			return ret;
+		}
+	}
+
 	atomic_set(&__sbdd.refs_cnt, 1);
 
 	/*
@@ -173,23 +240,14 @@ static void sbdd_delete(void)
 	atomic_dec_if_positive(&__sbdd.refs_cnt);
 	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
 
+	if (__sbdd.target)
+		sbdd_put_target();
+
 	/* gd will be removed only after the last reference put */
 	if (__sbdd.gd) {
 		pr_info("deleting disk\n");
 		del_gendisk(__sbdd.gd);
-	}
-
-	if (__sbdd.q) {
-		pr_info("cleaning up queue\n");
-		blk_cleanup_queue(__sbdd.q);
-	}
-
-	if (__sbdd.gd)
 		put_disk(__sbdd.gd);
-
-	if (__sbdd.data) {
-		pr_info("freeing data\n");
-		vfree(__sbdd.data);
 	}
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
@@ -241,8 +299,9 @@ module_init(sbdd_init);
 /* Called on module unloading. Unloading module is not allowed without it. */
 module_exit(sbdd_exit);
 
-/* Set desired capacity with insmod */
-module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
+/* Set target device path with insmod */
+module_param_named(target, __sbdd_param_target_path, charp, 0644);
+MODULE_PARM_DESC(target, "Target block device path");
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
